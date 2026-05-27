@@ -1,0 +1,25 @@
+name: Tokyo Water Monthly Scraper
+slug: tokyo_water_monthly
+version: "1.0.0"
+description: Scrape Tokyo Waterworks usage and charge history, then write JSON to /share
+arch:
+  - amd64
+startup: services
+boot: auto
+init: false
+map:
+  - share:rw
+
+options:
+  username: ""
+  password: ""
+  interval_hours: 12
+  api_url: "https://api.suidoapp.waterworks.metro.tokyo.lg.jp/user"
+  debug: false
+
+schema:
+  username: str
+  password: password
+  interval_hours: int(1,168)
+  api_url: str
+  debug: bool
