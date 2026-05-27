@@ -14,21 +14,21 @@ Env:
 
 import json
 import os
+import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
+from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
-from enecoq_data_fetcher import config as config_module
-from enecoq_data_fetcher import controller
-from enecoq_data_fetcher import logger
+from playwright.sync_api import Page, sync_playwright
 
 
 DEFAULT_LOGIN_URL = "https://www.cyberhome.ne.jp/app/sslLogin.do"
 OUT_JSON = "/share/enecoq_electricity.json"
-STATE_JSON = "/data/enecoq_electricity_state.json"
 TOKYO_TZ = ZoneInfo("Asia/Tokyo")
+FIRST_HISTORY_YEAR = 2023
 
 
 def log(message: str) -> None:
@@ -43,122 +43,242 @@ def _debug_enabled() -> bool:
     return str(os.environ.get("ENECOQ_DEBUG", "")).lower() in ("1", "true", "yes", "on")
 
 
-def _normalize_period(raw: Dict[str, Any]) -> Dict[str, Any]:
-    now = datetime.now(TOKYO_TZ)
-    return {
-        "period": str(raw["period"]),
-        "month": now.strftime("%Y-%m"),
-        "timestamp": raw["timestamp"],
-        "usage_kwh": raw["usage"],
-        "cost_jpy": raw["cost"],
-        "co2_kg": raw["co2"],
-    }
-
-
-def _load_state() -> Dict[str, Any]:
+def _debug_dump(page: Page, tag: str) -> None:
+    if not _debug_enabled():
+        return
     try:
-        with open(STATE_JSON, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        if isinstance(state, dict):
-            return state
-    except FileNotFoundError:
+        Path(f"/share/enecoq_{tag}.html").write_text(page.content(), encoding="utf-8")
+    except Exception:
         pass
-    except Exception as exc:
-        log(f"state load failed, starting fresh: {exc}")
-    return {}
+    try:
+        page.screenshot(path=f"/share/enecoq_{tag}.png", full_page=True)
+    except Exception:
+        pass
 
 
-def _update_total(month: Dict[str, Any]) -> Dict[str, Any]:
-    state = _load_state()
-    month_key = str(month["month"])
-    month_usage = float(month["usage_kwh"])
-    month_cost = float(month["cost_jpy"])
+def _num(text: str) -> float:
+    return float(text.replace(",", ""))
 
-    total_usage = float(state.get("total_usage_kwh") or 0.0)
-    total_cost = float(state.get("total_cost_jpy") or 0.0)
-    last_month_key = state.get("last_month")
-    last_month_usage = state.get("last_month_usage_kwh")
-    last_month_cost = state.get("last_month_cost_jpy")
 
-    if last_month_usage is None:
-        usage_delta = month_usage
-        reason = "initial"
-    elif last_month_key == month_key:
-        usage_delta = month_usage - float(last_month_usage)
-        reason = "same_month"
-    else:
-        usage_delta = month_usage
-        reason = "new_month"
-
-    if last_month_cost is None:
-        cost_delta = month_cost
-    elif last_month_key == month_key:
-        cost_delta = month_cost - float(last_month_cost)
-    else:
-        cost_delta = month_cost
-
-    if usage_delta < 0:
-        log(f"negative monthly usage delta ignored: {usage_delta}")
-        usage_delta = 0.0
-        reason = "ignored_negative_delta"
-    if cost_delta < 0:
-        log(f"negative monthly cost delta ignored: {cost_delta}")
-        cost_delta = 0.0
-        reason = "ignored_negative_delta"
-
-    total_usage += usage_delta
-    total_cost += cost_delta
-    new_state = {
-        "total_usage_kwh": round(total_usage, 6),
-        "total_cost_jpy": round(total_cost, 2),
-        "last_month": month_key,
-        "last_month_usage_kwh": month_usage,
-        "last_month_cost_jpy": month_cost,
-        "last_update_reason": reason,
-        "last_delta_kwh": round(usage_delta, 6),
-        "last_cost_delta_jpy": round(cost_delta, 2),
-        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+def _history_url(kind: str, year: int, month: int, session: Dict[str, str]) -> str:
+    path = "ryg_usage/" if kind == "usage" else "ryg_yen/"
+    query = {
+        "year": str(year),
+        "month": f"{month:02d}",
+        "cal": "m",
+        **session,
     }
-    atomic_write_json(STATE_JSON, new_state)
-    return new_state
+    return f"https://ses.me-eco.jp/pc/room/electric/cat/{path}?{urlencode(query)}"
+
+
+def _parse_daily_table(text: str, unit: str) -> Dict[int, Dict[str, float]]:
+    pattern = re.compile(
+        rf"(\d{{1,2}})日\s+([\d,]+\.\d+)\s+{unit}\s+"
+        rf"([\d,]+\.\d+)\s+{unit}\s+([\d,]+\.\d+)\s+{unit}\s+"
+        rf"([\d,]+\.\d+)\s+{unit}"
+    )
+    rows: Dict[int, Dict[str, float]] = {}
+    for match in pattern.finditer(text):
+        day = int(match.group(1))
+        rows[day] = {
+            "low": _num(match.group(2)),
+            "mid": _num(match.group(3)),
+            "high": _num(match.group(4)),
+            "total": _num(match.group(5)),
+        }
+    return rows
+
+
+def _parse_monthly_table(text: str, unit: str) -> Dict[int, Dict[str, float]]:
+    pattern = re.compile(
+        rf"(\d{{1,2}})月\s+([\d,]+\.\d+)\s+{unit}\s+"
+        rf"([\d,]+\.\d+)\s+{unit}\s+([\d,]+\.\d+)\s+{unit}\s+"
+        rf"([\d,]+\.\d+)\s+{unit}"
+    )
+    rows: Dict[int, Dict[str, float]] = {}
+    for match in pattern.finditer(text):
+        month = int(match.group(1))
+        rows[month] = {
+            "low": _num(match.group(2)),
+            "mid": _num(match.group(3)),
+            "high": _num(match.group(4)),
+            "total": _num(match.group(5)),
+        }
+    return rows
+
+
+def _fetch_metric_page(page: Page, kind: str, year: int, month: int, session: Dict[str, str]) -> Dict[str, Dict[int, Dict[str, float]]]:
+    unit = "kWh" if kind == "usage" else "円"
+    url = _history_url(kind, year, month, session)
+    response = page.goto(url, wait_until="networkidle")
+    if response is None or response.status >= 400:
+        raise RuntimeError(f"{kind} page failed for {year}-{month:02d}: HTTP {response.status if response else 'none'}")
+    body_text = page.locator("body").inner_text(timeout=10000)
+    if "有効期限切れ" in body_text or "エラーが発生しました" in body_text:
+        _debug_dump(page, f"{kind}_{year}_{month:02d}_error")
+        raise RuntimeError(f"{kind} page session expired for {year}-{month:02d}")
+
+    tables = page.locator("table")
+    if tables.count() < 2:
+        _debug_dump(page, f"{kind}_{year}_{month:02d}_no_tables")
+        raise RuntimeError(f"{kind} page missing expected tables for {year}-{month:02d}")
+
+    return {
+        "daily": _parse_daily_table(tables.nth(0).inner_text(), unit),
+        "monthly": _parse_monthly_table(tables.nth(1).inner_text(), unit),
+    }
+
+
+def _open_detail_page(page: Page) -> Page:
+    page.wait_for_load_state("networkidle")
+    mini_frames = [frame for frame in page.frames if "ses.me-eco.jp/mini" in frame.url]
+    if not mini_frames:
+        raise RuntimeError("enecoQ mini iframe not found")
+    mini = mini_frames[0]
+    with page.context.expect_page(timeout=15000) as popup:
+        mini.locator("input[type='image']").click()
+    detail = popup.value
+    detail.wait_for_load_state("networkidle")
+    return detail
+
+
+def _session_from_detail_url(detail_url: str) -> Dict[str, str]:
+    query = parse_qs(urlparse(detail_url).query)
+    session = {key: values[0] for key, values in query.items() if key in ("PHPSESSID", "svr_id") and values}
+    if "PHPSESSID" not in session or "svr_id" not in session:
+        raise RuntimeError("enecoQ detail session parameters not found")
+    return session
+
+
+def _login(page: Page, username: str, password: str, login_url: str) -> None:
+    page.goto(login_url, wait_until="networkidle")
+    page.locator("input[name='user_id']").fill(username)
+    page.locator("input[name='password']").fill(password)
+    page.locator("button[type='submit']").click()
+    page.wait_for_load_state("networkidle")
+    if page.locator('a:has-text("ログアウト")').count() == 0:
+        _debug_dump(page, "login_failed")
+        raise RuntimeError("CYBERHOME login failed")
+
+
+def _merge_daily(history: Dict[str, Dict[str, Any]], year: int, month: int, usage_rows: Dict[int, Dict[str, float]], cost_rows: Dict[int, Dict[str, float]]) -> None:
+    for day, usage in usage_rows.items():
+        key = f"{year:04d}-{month:02d}-{day:02d}"
+        row = history.setdefault("daily", {}).setdefault(key, {"date": key})
+        row.update(
+            {
+                "low_kwh": usage["low"],
+                "mid_kwh": usage["mid"],
+                "high_kwh": usage["high"],
+                "usage_kwh": usage["total"],
+            }
+        )
+        cost = cost_rows.get(day)
+        if cost:
+            row.update(
+                {
+                    "low_jpy": cost["low"],
+                    "mid_jpy": cost["mid"],
+                    "high_jpy": cost["high"],
+                    "cost_jpy": cost["total"],
+                }
+            )
+
+
+def _merge_monthly(history: Dict[str, Dict[str, Any]], year: int, usage_rows: Dict[int, Dict[str, float]], cost_rows: Dict[int, Dict[str, float]]) -> None:
+    for month, usage in usage_rows.items():
+        key = f"{year:04d}-{month:02d}"
+        row = history.setdefault("monthly", {}).setdefault(key, {"month": key})
+        row["usage_kwh"] = usage["total"]
+        cost = cost_rows.get(month)
+        if cost:
+            row["cost_jpy"] = cost["total"]
+
+
+def _history_years() -> List[int]:
+    now = datetime.now(TOKYO_TZ)
+    return list(range(FIRST_HISTORY_YEAR, now.year + 1))
+
+
+def _combined_total(daily_rows: List[Dict[str, Any]], monthly_rows: List[Dict[str, Any]], field: str) -> float:
+    if not daily_rows:
+        return sum(float(row[field]) for row in monthly_rows)
+
+    first_daily = date.fromisoformat(daily_rows[0]["date"])
+    total = sum(
+        float(row[field])
+        for row in monthly_rows
+        if date.fromisoformat(f"{row['month']}-01") < first_daily.replace(day=1)
+    )
+    total += sum(float(row[field]) for row in daily_rows)
+    return total
 
 
 def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
-    # The upstream package hard-codes the CYBERHOME login URL. Keep the add-on
-    # option for future compatibility, but use the verified repo method by default.
-    if login_url != DEFAULT_LOGIN_URL:
-        log(f"custom login_url is ignored by upstream fetcher: {login_url}")
+    now = datetime.now(TOKYO_TZ)
+    history: Dict[str, Dict[str, Any]] = {"daily": {}, "monthly": {}}
 
-    config = config_module.Config(
-        log_level="DEBUG" if _debug_enabled() else "INFO",
-        timeout=45,
-        max_retries=3,
-    )
-    logger.setup_logger(log_level=config.log_level)
-    client = controller.EnecoQController(username, password, config=config)
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        try:
+            page = browser.new_page()
+            log(f"open login page {login_url}")
+            _login(page, username, password, login_url)
+            log("login ok")
+            detail = _open_detail_page(page)
+            session = _session_from_detail_url(detail.url)
+            log("enecoQ detail session ok")
 
-    month_raw = client.fetch_power_data(
-        period="month",
-        output_format="json",
-        output_path="/tmp/enecoq_month.json",
-    ).to_dict()
-    month = _normalize_period(month_raw)
-    total_state = _update_total(month)
+            for year in _history_years():
+                months = range(1, 13)
+                if year == now.year:
+                    months = range(1, now.month + 1)
+                log(f"fetch year {year}")
+                yearly_usage_rows: Dict[int, Dict[str, float]] = {}
+                yearly_cost_rows: Dict[int, Dict[str, float]] = {}
+
+                for month in months:
+                    usage = _fetch_metric_page(detail, "usage", year, month, session)
+                    cost = _fetch_metric_page(detail, "cost", year, month, session)
+                    _merge_daily(history, year, month, usage["daily"], cost["daily"])
+                    yearly_usage_rows.update(usage["monthly"])
+                    yearly_cost_rows.update(cost["monthly"])
+
+                _merge_monthly(history, year, yearly_usage_rows, yearly_cost_rows)
+        finally:
+            browser.close()
+
+    daily_rows = [
+        row
+        for _, row in sorted(history["daily"].items())
+        if row.get("usage_kwh") is not None and row.get("cost_jpy") is not None
+    ]
+    monthly_rows = [
+        row
+        for _, row in sorted(history["monthly"].items())
+        if row.get("usage_kwh") is not None and row.get("cost_jpy") is not None
+    ]
+
+    total_usage = round(_combined_total(daily_rows, monthly_rows, "usage_kwh"), 6)
+    total_cost = round(_combined_total(daily_rows, monthly_rows, "cost_jpy"), 2)
+    latest_daily = daily_rows[-1] if daily_rows else None
+    latest_monthly = monthly_rows[-1] if monthly_rows else None
     fetched_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     return {
         "source": "enecoq",
         "fetched_at": fetched_at,
         "timezone": "Asia/Tokyo",
-        "total_usage_kwh": total_state["total_usage_kwh"],
-        "total_cost_jpy": total_state["total_cost_jpy"],
-        "last_delta_kwh": total_state["last_delta_kwh"],
-        "last_cost_delta_jpy": total_state["last_cost_delta_jpy"],
-        "month_usage_kwh": month["usage_kwh"],
-        "month_cost_jpy": month["cost_jpy"],
-        "month_co2_kg": month["co2_kg"],
-        "month": month["month"],
-        "last_update_reason": total_state["last_update_reason"],
+        "history_start": daily_rows[0]["date"] if daily_rows else None,
+        "history_end": daily_rows[-1]["date"] if daily_rows else None,
+        "daily_count": len(daily_rows),
+        "monthly_count": len(monthly_rows),
+        "total_usage_kwh": total_usage,
+        "total_cost_jpy": total_cost,
+        "latest_daily": latest_daily,
+        "latest_monthly": latest_monthly,
+        "daily": daily_rows,
+        "monthly": monthly_rows,
     }
 
 

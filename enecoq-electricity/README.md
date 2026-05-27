@@ -1,6 +1,6 @@
 # enecoQ Electricity Scraper
 
-Home Assistant add-on that logs in to CYBERHOME/enecoQ, reads this month's electricity data, and maintains monotonic energy and cost totals suitable for Home Assistant Energy.
+Home Assistant add-on that logs in to CYBERHOME/enecoQ, reads daily electricity usage/cost history, and exposes cumulative energy and cost totals suitable for Home Assistant Energy.
 
 It is intended for CYBERHOME/enecoQ accounts where the logged-in page contains the enecoQ usage iframe.
 
@@ -40,9 +40,9 @@ The JSON contains:
 
 - `total_usage_kwh`
 - `total_cost_jpy`
-- `last_delta_kwh`
-- `last_cost_delta_jpy`
-- `month_usage_kwh`, `month_cost_jpy`, `month_co2_kg`
+- `history_start`, `history_end`
+- `daily`: daily usage/cost rows
+- `monthly`: monthly usage/cost rows
 
 The add-on writes the latest output to:
 
@@ -50,11 +50,7 @@ The add-on writes the latest output to:
 /share/enecoq_electricity.json
 ```
 
-It stores persistent total state in:
-
-```text
-/data/enecoq_electricity_state.json
-```
+The totals are calculated from the scraped history on every run. If the account has monthly rows before daily rows are available, the add-on uses monthly rows for the older period and daily rows from the first available daily date onward.
 
 ## Home Assistant Sensors
 
@@ -96,12 +92,11 @@ In Home Assistant Energy:
 
 ## Why Total Instead of Today or Month
 
-enecoQ exposes cumulative usage for the current month. This add-on turns that monthly value into a monotonic total:
+enecoQ exposes daily and monthly usage pages. This add-on turns the scraped daily history into cumulative totals:
 
-- On the first run, `total_usage_kwh` starts from the current monthly usage.
-- During the same month, it adds only the increase since the last scrape.
-- At the start of a new month, enecoQ's monthly value resets, but the add-on keeps `total_usage_kwh` increasing.
-- The same logic is applied to `total_cost_jpy`.
+- `total_usage_kwh` is the cumulative scraped kWh total.
+- `total_cost_jpy` is the cumulative scraped JPY total.
+- The `daily` array can also be used to backfill Home Assistant recorder statistics.
 
 This makes the sensor behave like a normal electricity meter, which is the cleanest shape for Home Assistant Energy.
 
@@ -110,8 +105,9 @@ This makes the sensor behave like a normal electricity meter, which is the clean
 Check the add-on log first. A successful run should include:
 
 ```text
-Login successful
-Successfully fetched month data
+login ok
+enecoQ detail session ok
+fetch year 2026
 wrote /share/enecoq_electricity.json
 ```
 
