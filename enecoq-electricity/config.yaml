@@ -1,0 +1,25 @@
+name: enecoQ Electricity Scraper
+slug: enecoq_electricity
+version: "1.0.0"
+description: Scrape enecoQ daily and monthly electricity usage and write JSON to /share
+arch:
+  - amd64
+startup: services
+boot: auto
+init: false
+map:
+  - share:rw
+
+options:
+  username: ""
+  password: ""
+  interval_hours: 6
+  login_url: "https://www.cyberhome.ne.jp/app/sslLogin.do"
+  debug: false
+
+schema:
+  username: str
+  password: password
+  interval_hours: int(1,168)
+  login_url: str
+  debug: bool

@@ -1,0 +1,21 @@
+name: Tokyo Gas Monthly Scraper
+slug: tokyo_gas_monthly
+version: "1.1.0"
+description: Scrape myTOKYOGAS monthly gas usage and write JSON to /share
+arch:
+  - amd64
+startup: services
+boot: auto
+init: false
+map:
+  - share:rw
+
+options:
+  username: ""
+  password: ""
+  interval_hours: 12
+
+schema:
+  username: str
+  password: password
+  interval_hours: int(1,168)
