@@ -1,7 +1,7 @@
 name: enecoQ Electricity Scraper
 slug: enecoq_electricity
-version: "1.1.0"
-description: Scrape enecoQ monthly electricity usage and expose a monotonic total for Home Assistant Energy
+version: "1.2.0"
+description: Scrape enecoQ monthly electricity usage and expose monotonic totals for Home Assistant Energy
 arch:
   - amd64
 startup: services

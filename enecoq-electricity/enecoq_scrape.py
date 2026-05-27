@@ -72,33 +72,51 @@ def _update_total(month: Dict[str, Any]) -> Dict[str, Any]:
     state = _load_state()
     month_key = str(month["month"])
     month_usage = float(month["usage_kwh"])
+    month_cost = float(month["cost_jpy"])
 
-    total = float(state.get("total_usage_kwh") or 0.0)
+    total_usage = float(state.get("total_usage_kwh") or 0.0)
+    total_cost = float(state.get("total_cost_jpy") or 0.0)
     last_month_key = state.get("last_month")
     last_month_usage = state.get("last_month_usage_kwh")
+    last_month_cost = state.get("last_month_cost_jpy")
 
     if last_month_usage is None:
-        delta = month_usage
+        usage_delta = month_usage
         reason = "initial"
     elif last_month_key == month_key:
-        delta = month_usage - float(last_month_usage)
+        usage_delta = month_usage - float(last_month_usage)
         reason = "same_month"
     else:
-        delta = month_usage
+        usage_delta = month_usage
         reason = "new_month"
 
-    if delta < 0:
-        log(f"negative monthly delta ignored: {delta}")
-        delta = 0.0
+    if last_month_cost is None:
+        cost_delta = month_cost
+    elif last_month_key == month_key:
+        cost_delta = month_cost - float(last_month_cost)
+    else:
+        cost_delta = month_cost
+
+    if usage_delta < 0:
+        log(f"negative monthly usage delta ignored: {usage_delta}")
+        usage_delta = 0.0
+        reason = "ignored_negative_delta"
+    if cost_delta < 0:
+        log(f"negative monthly cost delta ignored: {cost_delta}")
+        cost_delta = 0.0
         reason = "ignored_negative_delta"
 
-    total += delta
+    total_usage += usage_delta
+    total_cost += cost_delta
     new_state = {
-        "total_usage_kwh": round(total, 6),
+        "total_usage_kwh": round(total_usage, 6),
+        "total_cost_jpy": round(total_cost, 2),
         "last_month": month_key,
         "last_month_usage_kwh": month_usage,
+        "last_month_cost_jpy": month_cost,
         "last_update_reason": reason,
-        "last_delta_kwh": round(delta, 6),
+        "last_delta_kwh": round(usage_delta, 6),
+        "last_cost_delta_jpy": round(cost_delta, 2),
         "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
     atomic_write_json(STATE_JSON, new_state)
@@ -133,7 +151,9 @@ def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
         "fetched_at": fetched_at,
         "timezone": "Asia/Tokyo",
         "total_usage_kwh": total_state["total_usage_kwh"],
+        "total_cost_jpy": total_state["total_cost_jpy"],
         "last_delta_kwh": total_state["last_delta_kwh"],
+        "last_cost_delta_jpy": total_state["last_cost_delta_jpy"],
         "month_usage_kwh": month["usage_kwh"],
         "month_cost_jpy": month["cost_jpy"],
         "month_co2_kg": month["co2_kg"],
