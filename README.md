@@ -1,6 +1,6 @@
-# Fang Home Assistant Add-ons
+# enecoQ Home Assistant Add-ons
 
-Personal Home Assistant add-on repository.
+Home Assistant add-on repository for enecoQ electricity usage scraping.
 
 ## Add to Home Assistant
 
