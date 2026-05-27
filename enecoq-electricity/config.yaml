@@ -1,7 +1,7 @@
 name: enecoQ Electricity Scraper
 slug: enecoq_electricity
-version: "1.0.0"
-description: Scrape enecoQ daily and monthly electricity usage and write JSON to /share
+version: "1.1.0"
+description: Scrape enecoQ monthly electricity usage and expose a monotonic total for Home Assistant Energy
 arch:
   - amd64
 startup: services
@@ -13,7 +13,7 @@ map:
 options:
   username: ""
   password: ""
-  interval_hours: 6
+  interval_hours: 1
   login_url: "https://www.cyberhome.ne.jp/app/sslLogin.do"
   debug: false
 

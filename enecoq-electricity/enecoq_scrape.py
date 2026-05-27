@@ -27,6 +27,7 @@ from enecoq_data_fetcher import logger
 
 DEFAULT_LOGIN_URL = "https://www.cyberhome.ne.jp/app/sslLogin.do"
 OUT_JSON = "/share/enecoq_electricity.json"
+STATE_JSON = "/data/enecoq_electricity_state.json"
 TOKYO_TZ = ZoneInfo("Asia/Tokyo")
 
 
@@ -44,15 +45,64 @@ def _debug_enabled() -> bool:
 
 def _normalize_period(raw: Dict[str, Any]) -> Dict[str, Any]:
     now = datetime.now(TOKYO_TZ)
-    period = str(raw["period"])
     return {
-        "period": period,
-        "date": now.date().isoformat() if period == "today" else now.strftime("%Y-%m"),
+        "period": str(raw["period"]),
+        "month": now.strftime("%Y-%m"),
         "timestamp": raw["timestamp"],
         "usage_kwh": raw["usage"],
         "cost_jpy": raw["cost"],
         "co2_kg": raw["co2"],
     }
+
+
+def _load_state() -> Dict[str, Any]:
+    try:
+        with open(STATE_JSON, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if isinstance(state, dict):
+            return state
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log(f"state load failed, starting fresh: {exc}")
+    return {}
+
+
+def _update_total(month: Dict[str, Any]) -> Dict[str, Any]:
+    state = _load_state()
+    month_key = str(month["month"])
+    month_usage = float(month["usage_kwh"])
+
+    total = float(state.get("total_usage_kwh") or 0.0)
+    last_month_key = state.get("last_month")
+    last_month_usage = state.get("last_month_usage_kwh")
+
+    if last_month_usage is None:
+        delta = month_usage
+        reason = "initial"
+    elif last_month_key == month_key:
+        delta = month_usage - float(last_month_usage)
+        reason = "same_month"
+    else:
+        delta = month_usage
+        reason = "new_month"
+
+    if delta < 0:
+        log(f"negative monthly delta ignored: {delta}")
+        delta = 0.0
+        reason = "ignored_negative_delta"
+
+    total += delta
+    new_state = {
+        "total_usage_kwh": round(total, 6),
+        "last_month": month_key,
+        "last_month_usage_kwh": month_usage,
+        "last_update_reason": reason,
+        "last_delta_kwh": round(delta, 6),
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    atomic_write_json(STATE_JSON, new_state)
+    return new_state
 
 
 def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
@@ -69,30 +119,26 @@ def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
     logger.setup_logger(log_level=config.log_level)
     client = controller.EnecoQController(username, password, config=config)
 
-    today_raw = client.fetch_power_data(
-        period="today",
-        output_format="json",
-        output_path="/tmp/enecoq_today.json",
-    ).to_dict()
     month_raw = client.fetch_power_data(
         period="month",
         output_format="json",
         output_path="/tmp/enecoq_month.json",
     ).to_dict()
-    today = _normalize_period(today_raw)
     month = _normalize_period(month_raw)
+    total_state = _update_total(month)
     fetched_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     return {
         "source": "enecoq",
         "fetched_at": fetched_at,
         "timezone": "Asia/Tokyo",
-        "today": today,
-        "month": month,
-        "latest_today_usage_kwh": today["usage_kwh"],
-        "latest_today_cost_jpy": today["cost_jpy"],
-        "current_month_usage_kwh": month["usage_kwh"],
-        "current_month_cost_jpy": month["cost_jpy"],
+        "total_usage_kwh": total_state["total_usage_kwh"],
+        "last_delta_kwh": total_state["last_delta_kwh"],
+        "month_usage_kwh": month["usage_kwh"],
+        "month_cost_jpy": month["cost_jpy"],
+        "month_co2_kg": month["co2_kg"],
+        "month": month["month"],
+        "last_update_reason": total_state["last_update_reason"],
     }
 
 
