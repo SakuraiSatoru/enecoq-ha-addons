@@ -2,23 +2,69 @@
 
 Home Assistant add-on that logs in to CYBERHOME/enecoQ, reads this month's electricity data, and maintains monotonic energy and cost totals suitable for Home Assistant Energy.
 
+It is intended for CYBERHOME/enecoQ accounts where the logged-in page contains the enecoQ usage iframe.
+
+## Install
+
+Add this add-on repository in Home Assistant:
+
 ```text
-/share/enecoq_electricity.json
+https://github.com/SakuraiSatoru/enecoq-ha-addons
 ```
+
+Home Assistant path:
+
+```text
+Settings -> Add-ons -> Add-on Store -> ... -> Repositories
+```
+
+Refresh the Add-on Store, open `enecoQ Electricity Scraper`, and install it.
+
+## Configure
+
+Set the add-on options:
+
+```yaml
+username: your-cyberhome-email@example.cyberhome.ne.jp
+password: your-cyberhome-mail-password
+interval_hours: 1
+login_url: https://www.cyberhome.ne.jp/app/sslLogin.do
+debug: false
+```
+
+Then start the add-on and enable `Start on boot`.
+
+## Output
 
 The JSON contains:
 
 - `total_usage_kwh`
 - `total_cost_jpy`
 - `last_delta_kwh`
+- `last_cost_delta_jpy`
 - `month_usage_kwh`, `month_cost_jpy`, `month_co2_kg`
 
-Example Home Assistant sensors:
+The add-on writes the latest output to:
+
+```text
+/share/enecoq_electricity.json
+```
+
+It stores persistent total state in:
+
+```text
+/data/enecoq_electricity_state.json
+```
+
+## Home Assistant Sensors
+
+Add these sensors to `configuration.yaml`:
 
 ```yaml
 command_line:
   - sensor:
       name: enecoQ Total Usage
+      unique_id: enecoq_total_usage
       command: "cat /share/enecoq_electricity.json"
       value_template: "{{ value_json.total_usage_kwh }}"
       unit_of_measurement: kWh
@@ -27,6 +73,7 @@ command_line:
       scan_interval: 300
   - sensor:
       name: enecoQ Total Cost
+      unique_id: enecoq_total_cost
       command: "cat /share/enecoq_electricity.json"
       value_template: "{{ value_json.total_cost_jpy }}"
       unit_of_measurement: JPY
@@ -35,4 +82,39 @@ command_line:
       scan_interval: 300
 ```
 
-The add-on stores its persistent total state in `/data/enecoq_electricity_state.json`.
+Restart Home Assistant Core after changing `configuration.yaml`.
+
+## Energy Dashboard
+
+In Home Assistant Energy:
+
+- Electricity grid consumption: `enecoQ Total Usage`
+- Return to grid: leave empty unless you have a separate export sensor
+- Cost tracking: choose `Use an entity tracking total costs`
+- Cost entity: `enecoQ Total Cost`
+- Power measurement type: `No power sensor`
+
+## Why Total Instead of Today or Month
+
+enecoQ exposes cumulative usage for the current month. This add-on turns that monthly value into a monotonic total:
+
+- On the first run, `total_usage_kwh` starts from the current monthly usage.
+- During the same month, it adds only the increase since the last scrape.
+- At the start of a new month, enecoQ's monthly value resets, but the add-on keeps `total_usage_kwh` increasing.
+- The same logic is applied to `total_cost_jpy`.
+
+This makes the sensor behave like a normal electricity meter, which is the cleanest shape for Home Assistant Energy.
+
+## Troubleshooting
+
+Check the add-on log first. A successful run should include:
+
+```text
+Login successful
+Successfully fetched month data
+wrote /share/enecoq_electricity.json
+```
+
+If Home Assistant Energy does not show the sensors immediately, wait a few minutes or restart Home Assistant Core after adding the `command_line` sensors.
+
+If the add-on fails to parse the page, enable `debug: true` and restart the add-on. Then inspect the add-on logs and generated debug artifacts.
