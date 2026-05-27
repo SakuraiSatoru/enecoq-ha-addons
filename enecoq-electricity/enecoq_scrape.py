@@ -110,7 +110,7 @@ def _parse_monthly_table(text: str, unit: str) -> Dict[int, Dict[str, float]]:
 def _fetch_metric_page(page: Page, kind: str, year: int, month: int, session: Dict[str, str]) -> Dict[str, Dict[int, Dict[str, float]]]:
     unit = "kWh" if kind == "usage" else "円"
     url = _history_url(kind, year, month, session)
-    response = page.goto(url, wait_until="networkidle")
+    response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
     if response is None or response.status >= 400:
         raise RuntimeError(f"{kind} page failed for {year}-{month:02d}: HTTP {response.status if response else 'none'}")
     body_text = page.locator("body").inner_text(timeout=10000)
@@ -222,6 +222,8 @@ def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
         browser = playwright.chromium.launch(headless=True)
         try:
             page = browser.new_page()
+            page.set_default_timeout(45000)
+            page.set_default_navigation_timeout(45000)
             log(f"open login page {login_url}")
             _login(page, username, password, login_url)
             log("login ok")
@@ -238,6 +240,7 @@ def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
                 yearly_cost_rows: Dict[int, Dict[str, float]] = {}
 
                 for month in months:
+                    log(f"fetch month {year}-{month:02d}")
                     usage = _fetch_metric_page(detail, "usage", year, month, session)
                     cost = _fetch_metric_page(detail, "cost", year, month, session)
                     _merge_daily(history, year, month, usage["daily"], cost["daily"])
