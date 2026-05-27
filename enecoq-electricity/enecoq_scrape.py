@@ -18,7 +18,7 @@ import re
 import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 from zoneinfo import ZoneInfo
 
@@ -200,6 +200,45 @@ def _history_years() -> List[int]:
     return list(range(FIRST_HISTORY_YEAR, now.year + 1))
 
 
+def _load_existing_history() -> Dict[str, Dict[str, Any]]:
+    try:
+        with open(OUT_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {"daily": {}, "monthly": {}}
+    except Exception as exc:
+        log(f"existing history load failed, starting full refresh: {exc}")
+        return {"daily": {}, "monthly": {}}
+
+    daily = data.get("daily") if isinstance(data, dict) else None
+    monthly = data.get("monthly") if isinstance(data, dict) else None
+    if not isinstance(daily, list) or not isinstance(monthly, list):
+        return {"daily": {}, "monthly": {}}
+    return {
+        "daily": {row["date"]: row for row in daily if isinstance(row, dict) and row.get("date")},
+        "monthly": {row["month"]: row for row in monthly if isinstance(row, dict) and row.get("month")},
+    }
+
+
+def _months_to_fetch(has_history: bool, now: datetime) -> List[Tuple[int, int]]:
+    if not has_history:
+        months: List[Tuple[int, int]] = []
+        for year in _history_years():
+            last_month = now.month if year == now.year else 12
+            months.extend((year, month) for month in range(1, last_month + 1))
+        return months
+
+    months_set: Set[Tuple[int, int]] = {(now.year, now.month)}
+    previous_month = now.month - 1
+    previous_year = now.year
+    if previous_month < 1:
+        previous_month = 12
+        previous_year -= 1
+    if previous_year >= FIRST_HISTORY_YEAR:
+        months_set.add((previous_year, previous_month))
+    return sorted(months_set)
+
+
 def _combined_total(daily_rows: List[Dict[str, Any]], monthly_rows: List[Dict[str, Any]], field: str) -> float:
     if not daily_rows:
         return sum(float(row[field]) for row in monthly_rows)
@@ -216,7 +255,8 @@ def _combined_total(daily_rows: List[Dict[str, Any]], monthly_rows: List[Dict[st
 
 def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
     now = datetime.now(TOKYO_TZ)
-    history: Dict[str, Dict[str, Any]] = {"daily": {}, "monthly": {}}
+    history = _load_existing_history()
+    months_to_fetch = _months_to_fetch(bool(history["daily"] and history["monthly"]), now)
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -231,10 +271,8 @@ def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
             session = _session_from_detail_url(detail.url)
             log("enecoQ detail session ok")
 
-            for year in _history_years():
-                months = range(1, 13)
-                if year == now.year:
-                    months = range(1, now.month + 1)
+            for year in sorted({year for year, _ in months_to_fetch}):
+                months = [month for fetch_year, month in months_to_fetch if fetch_year == year]
                 log(f"fetch year {year}")
                 yearly_usage_rows: Dict[int, Dict[str, float]] = {}
                 yearly_cost_rows: Dict[int, Dict[str, float]] = {}

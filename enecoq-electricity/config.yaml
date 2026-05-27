@@ -1,6 +1,6 @@
 name: enecoQ Electricity Scraper
 slug: enecoq_electricity
-version: "1.3.1"
+version: "1.3.2"
 description: Scrape enecoQ daily electricity usage/cost history and expose totals for Home Assistant Energy
 arch:
   - amd64

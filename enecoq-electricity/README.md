@@ -50,7 +50,7 @@ The add-on writes the latest output to:
 /share/enecoq_electricity.json
 ```
 
-The totals are calculated from the scraped history on every run. If the account has monthly rows before daily rows are available, the add-on uses monthly rows for the older period and daily rows from the first available daily date onward.
+The totals are calculated from scraped history. The first run performs a full history refresh; later runs reuse the saved history and refresh the current and previous month. If the account has monthly rows before daily rows are available, the add-on uses monthly rows for the older period and daily rows from the first available daily date onward.
 
 ## Home Assistant Sensors
 
