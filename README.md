@@ -35,7 +35,7 @@ Logs in to CYBERHOME/enecoQ, fetches the current monthly usage and cost, then ma
 - `enecoQ Total Usage`
 - `enecoQ Total Cost`
 
-The add-on uses the upstream `enecoq-data-fetcher` Python package for login and scraping.
+The add-on uses a lightweight HTTP session for login and scraping, without a bundled browser.
 
 For configuration and Energy Dashboard setup, see [the add-on README](enecoq-electricity/README.md).
 

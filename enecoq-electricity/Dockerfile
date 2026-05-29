@@ -1,6 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.60.0-noble
-
-RUN pip install --no-cache-dir enecoq-data-fetcher==2.2.1
+FROM ghcr.io/home-assistant/amd64-base-python:3.12-alpine3.23
 
 WORKDIR /app
 

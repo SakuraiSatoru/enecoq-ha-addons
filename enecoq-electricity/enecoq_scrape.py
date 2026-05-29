@@ -16,19 +16,20 @@ import json
 import os
 import re
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from html import unescape
+from http.cookiejar import CookieJar
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
-from urllib.parse import parse_qs, urlencode, urlparse
-from zoneinfo import ZoneInfo
-
-from playwright.sync_api import Page, sync_playwright
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
+from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 
 DEFAULT_LOGIN_URL = "https://www.cyberhome.ne.jp/app/sslLogin.do"
 OUT_JSON = "/share/enecoq_electricity.json"
-TOKYO_TZ = ZoneInfo("Asia/Tokyo")
+TOKYO_TZ = timezone(timedelta(hours=9), "Asia/Tokyo")
 FIRST_HISTORY_YEAR = 2023
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 
 def log(message: str) -> None:
@@ -43,17 +44,35 @@ def _debug_enabled() -> bool:
     return str(os.environ.get("ENECOQ_DEBUG", "")).lower() in ("1", "true", "yes", "on")
 
 
-def _debug_dump(page: Page, tag: str) -> None:
+def _debug_dump(content: str, tag: str) -> None:
     if not _debug_enabled():
         return
     try:
-        Path(f"/share/enecoq_{tag}.html").write_text(page.content(), encoding="utf-8")
+        Path(f"/share/enecoq_{tag}.html").write_text(content, encoding="utf-8")
     except Exception:
         pass
-    try:
-        page.screenshot(path=f"/share/enecoq_{tag}.png", full_page=True)
-    except Exception:
-        pass
+
+
+class HttpClient:
+    def __init__(self) -> None:
+        self._opener = build_opener(HTTPCookieProcessor(CookieJar()))
+
+    def request(self, url: str, data: Dict[str, str] | None = None, referer: str | None = None) -> Tuple[str, str, int]:
+        body = urlencode(data).encode("utf-8") if data is not None else None
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        }
+        if referer:
+            headers["Referer"] = referer
+        if body is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+        request = Request(url, data=body, headers=headers, method="POST" if body is not None else "GET")
+        with self._opener.open(request, timeout=45) as response:
+            raw = response.read()
+            charset = response.headers.get_content_charset() or "utf-8"
+            return raw.decode(charset, errors="replace"), response.geturl(), response.status
 
 
 def _num(text: str) -> float:
@@ -107,57 +126,79 @@ def _parse_monthly_table(text: str, unit: str) -> Dict[int, Dict[str, float]]:
     return rows
 
 
-def _fetch_metric_page(page: Page, kind: str, year: int, month: int, session: Dict[str, str]) -> Dict[str, Dict[int, Dict[str, float]]]:
+def _html_to_text(fragment: str) -> str:
+    fragment = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", fragment)
+    fragment = re.sub(r"(?i)</(tr|p|div|li|br|th|td)>", "\n", fragment)
+    text = re.sub(r"(?s)<[^>]+>", " ", fragment)
+    text = unescape(text)
+    return re.sub(r"[ \t\r\f\v]+", " ", text)
+
+
+def _fetch_metric_page(client: HttpClient, kind: str, year: int, month: int, session: Dict[str, str]) -> Dict[str, Dict[int, Dict[str, float]]]:
     unit = "kWh" if kind == "usage" else "円"
     url = _history_url(kind, year, month, session)
-    response = page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    if response is None or response.status >= 400:
-        raise RuntimeError(f"{kind} page failed for {year}-{month:02d}: HTTP {response.status if response else 'none'}")
-    body_text = page.locator("body").inner_text(timeout=10000)
+    html, _, status = client.request(url)
+    if status >= 400:
+        raise RuntimeError(f"{kind} page failed for {year}-{month:02d}: HTTP {status}")
+    body_text = _html_to_text(html)
     if "有効期限切れ" in body_text or "エラーが発生しました" in body_text:
-        _debug_dump(page, f"{kind}_{year}_{month:02d}_error")
+        _debug_dump(html, f"{kind}_{year}_{month:02d}_error")
         raise RuntimeError(f"{kind} page session expired for {year}-{month:02d}")
 
-    tables = page.locator("table")
-    if tables.count() < 2:
-        _debug_dump(page, f"{kind}_{year}_{month:02d}_no_tables")
+    tables = re.findall(r"(?is)<table\b.*?</table>", html)
+    if len(tables) < 2:
+        _debug_dump(html, f"{kind}_{year}_{month:02d}_no_tables")
         raise RuntimeError(f"{kind} page missing expected tables for {year}-{month:02d}")
 
     return {
-        "daily": _parse_daily_table(tables.nth(0).inner_text(), unit),
-        "monthly": _parse_monthly_table(tables.nth(1).inner_text(), unit),
+        "daily": _parse_daily_table(_html_to_text(tables[0]), unit),
+        "monthly": _parse_monthly_table(_html_to_text(tables[1]), unit),
     }
 
 
-def _open_detail_page(page: Page) -> Page:
-    page.wait_for_load_state("networkidle")
-    mini_frames = [frame for frame in page.frames if "ses.me-eco.jp/mini" in frame.url]
-    if not mini_frames:
-        raise RuntimeError("enecoQ mini iframe not found")
-    mini = mini_frames[0]
-    with page.context.expect_page(timeout=15000) as popup:
-        mini.locator("input[type='image']").click()
-    detail = popup.value
-    detail.wait_for_load_state("networkidle")
-    return detail
+def _open_detail_session(client: HttpClient, login_url: str) -> Dict[str, str]:
+    mini_url = urljoin(login_url, "/app/ses_mini.do")
+    mini_html, _, status = client.request(mini_url, referer=login_url)
+    if status >= 400:
+        raise RuntimeError(f"enecoQ mini iframe failed: HTTP {status}")
+    token_match = re.search(r'name=["\']token["\']\s+value=["\']([^"\']+)["\']', mini_html)
+    if not token_match:
+        _debug_dump(mini_html, "mini_missing_token")
+        raise RuntimeError("enecoQ mini token not found")
+
+    detail_html, detail_url, status = client.request(
+        "https://ses.me-eco.jp/mini/",
+        data={"token": token_match.group(1), "GO": "GO"},
+        referer=mini_url,
+    )
+    if status >= 400:
+        raise RuntimeError(f"enecoQ mini session failed: HTTP {status}")
+    return _session_from_detail_html(detail_url, detail_html)
 
 
-def _session_from_detail_url(detail_url: str) -> Dict[str, str]:
+def _session_from_detail_html(detail_url: str, detail_html: str) -> Dict[str, str]:
     query = parse_qs(urlparse(detail_url).query)
     session = {key: values[0] for key, values in query.items() if key in ("PHPSESSID", "svr_id") and values}
+    for key in ("PHPSESSID", "svr_id"):
+        if key not in session:
+            match = re.search(rf'name=["\']{key}["\']\s+value=["\']([^"\']+)["\']', detail_html)
+            if match:
+                session[key] = match.group(1)
     if "PHPSESSID" not in session or "svr_id" not in session:
+        _debug_dump(detail_html, "detail_missing_session")
         raise RuntimeError("enecoQ detail session parameters not found")
     return session
 
 
-def _login(page: Page, username: str, password: str, login_url: str) -> None:
-    page.goto(login_url, wait_until="networkidle")
-    page.locator("input[name='user_id']").fill(username)
-    page.locator("input[name='password']").fill(password)
-    page.locator("button[type='submit']").click()
-    page.wait_for_load_state("networkidle")
-    if page.locator('a:has-text("ログアウト")').count() == 0:
-        _debug_dump(page, "login_failed")
+def _login(client: HttpClient, username: str, password: str, login_url: str) -> None:
+    client.request(login_url)
+    html, _, status = client.request(
+        urljoin(login_url, "/app/xLogin.do"),
+        data={"user_id": username, "password": password},
+        referer=login_url,
+    )
+    if status >= 400 or "ログアウト" not in html:
+        _debug_dump(html, "login_failed")
         raise RuntimeError("CYBERHOME login failed")
 
 
@@ -258,36 +299,28 @@ def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
     history = _load_existing_history()
     months_to_fetch = _months_to_fetch(bool(history["daily"] and history["monthly"]), now)
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
-        try:
-            page = browser.new_page()
-            page.set_default_timeout(45000)
-            page.set_default_navigation_timeout(45000)
-            log(f"open login page {login_url}")
-            _login(page, username, password, login_url)
-            log("login ok")
-            detail = _open_detail_page(page)
-            session = _session_from_detail_url(detail.url)
-            log("enecoQ detail session ok")
+    client = HttpClient()
+    log(f"open login page {login_url}")
+    _login(client, username, password, login_url)
+    log("login ok")
+    session = _open_detail_session(client, login_url)
+    log("enecoQ detail session ok")
 
-            for year in sorted({year for year, _ in months_to_fetch}):
-                months = [month for fetch_year, month in months_to_fetch if fetch_year == year]
-                log(f"fetch year {year}")
-                yearly_usage_rows: Dict[int, Dict[str, float]] = {}
-                yearly_cost_rows: Dict[int, Dict[str, float]] = {}
+    for year in sorted({year for year, _ in months_to_fetch}):
+        months = [month for fetch_year, month in months_to_fetch if fetch_year == year]
+        log(f"fetch year {year}")
+        yearly_usage_rows: Dict[int, Dict[str, float]] = {}
+        yearly_cost_rows: Dict[int, Dict[str, float]] = {}
 
-                for month in months:
-                    log(f"fetch month {year}-{month:02d}")
-                    usage = _fetch_metric_page(detail, "usage", year, month, session)
-                    cost = _fetch_metric_page(detail, "cost", year, month, session)
-                    _merge_daily(history, year, month, usage["daily"], cost["daily"])
-                    yearly_usage_rows.update(usage["monthly"])
-                    yearly_cost_rows.update(cost["monthly"])
+        for month in months:
+            log(f"fetch month {year}-{month:02d}")
+            usage = _fetch_metric_page(client, "usage", year, month, session)
+            cost = _fetch_metric_page(client, "cost", year, month, session)
+            _merge_daily(history, year, month, usage["daily"], cost["daily"])
+            yearly_usage_rows.update(usage["monthly"])
+            yearly_cost_rows.update(cost["monthly"])
 
-                _merge_monthly(history, year, yearly_usage_rows, yearly_cost_rows)
-        finally:
-            browser.close()
+        _merge_monthly(history, year, yearly_usage_rows, yearly_cost_rows)
 
     daily_rows = [
         row
