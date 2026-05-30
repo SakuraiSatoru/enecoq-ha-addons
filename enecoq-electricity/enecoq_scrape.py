@@ -30,6 +30,7 @@ OUT_JSON = "/share/enecoq_electricity.json"
 TOKYO_TZ = timezone(timedelta(hours=9), "Asia/Tokyo")
 FIRST_HISTORY_YEAR = 2023
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+JPY_FIELDS = ("low_jpy", "mid_jpy", "high_jpy", "cost_jpy")
 
 
 def log(message: str) -> None:
@@ -77,6 +78,13 @@ class HttpClient:
 
 def _num(text: str) -> float:
     return float(text.replace(",", ""))
+
+
+def _round_jpy_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    for field in JPY_FIELDS:
+        if row.get(field) is not None:
+            row[field] = round(float(row[field]))
+    return row
 
 
 def _history_url(kind: str, year: int, month: int, session: Dict[str, str]) -> str:
@@ -218,10 +226,10 @@ def _merge_daily(history: Dict[str, Dict[str, Any]], year: int, month: int, usag
         if cost:
             row.update(
                 {
-                    "low_jpy": cost["low"],
-                    "mid_jpy": cost["mid"],
-                    "high_jpy": cost["high"],
-                    "cost_jpy": cost["total"],
+                    "low_jpy": round(cost["low"]),
+                    "mid_jpy": round(cost["mid"]),
+                    "high_jpy": round(cost["high"]),
+                    "cost_jpy": round(cost["total"]),
                 }
             )
 
@@ -233,7 +241,7 @@ def _merge_monthly(history: Dict[str, Dict[str, Any]], year: int, usage_rows: Di
         row["usage_kwh"] = usage["total"]
         cost = cost_rows.get(month)
         if cost:
-            row["cost_jpy"] = cost["total"]
+            row["cost_jpy"] = round(cost["total"])
 
 
 def _history_years() -> List[int]:
@@ -323,18 +331,18 @@ def scrape(username: str, password: str, login_url: str) -> Dict[str, Any]:
         _merge_monthly(history, year, yearly_usage_rows, yearly_cost_rows)
 
     daily_rows = [
-        row
+        _round_jpy_fields(row)
         for _, row in sorted(history["daily"].items())
         if row.get("usage_kwh") is not None and row.get("cost_jpy") is not None
     ]
     monthly_rows = [
-        row
+        _round_jpy_fields(row)
         for _, row in sorted(history["monthly"].items())
         if row.get("usage_kwh") is not None and row.get("cost_jpy") is not None
     ]
 
     total_usage = round(_combined_total(daily_rows, monthly_rows, "usage_kwh"), 6)
-    total_cost = round(_combined_total(daily_rows, monthly_rows, "cost_jpy"), 2)
+    total_cost = round(_combined_total(daily_rows, monthly_rows, "cost_jpy"))
     latest_daily = daily_rows[-1] if daily_rows else None
     latest_monthly = monthly_rows[-1] if monthly_rows else None
     fetched_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
